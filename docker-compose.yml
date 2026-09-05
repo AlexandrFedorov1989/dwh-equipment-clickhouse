@@ -1,0 +1,312 @@
+services:
+
+  # ──────────────────────────────────────────────
+  # Источник: PostgreSQL (OLTP)
+  # ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16
+    container_name: dwh-postgres
+    restart: unless-stopped
+    shm_size: 128mb
+    env_file: .env
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/pg:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ──────────────────────────────────────────────
+  # Аналитическая БД: ClickHouse (ODS / DDS / DM)
+  # ──────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: dwh-clickhouse
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "8123:8123"   # HTTP
+      - "9000:9000"   # нативный TCP
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/config.xml:ro
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/users.xml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "clickhouse-client --user $${CLICKHOUSE_USER} --password $${CLICKHOUSE_PASSWORD} --query 'SELECT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      # бакет ch-cold должен существовать до access-check S3-диска
+      minio-init:
+        condition: service_completed_successfully
+
+  # ──────────────────────────────────────────────
+  # S3-совместимое хранилище: MinIO
+  # ──────────────────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-01-16T16-07-38Z
+    container_name: dwh-minio
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "9001:9001"   # Web UI
+      - "9090:9000"   # S3 API снаружи на 9090; 9000 занят ClickHouse
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Бакет ch-cold — cold volume ClickHouse (TTL TO VOLUME); один раз после up / down -v
+  minio-init:
+    image: minio/mc:RELEASE.2024-08-17T11-33-50Z
+    container_name: dwh-minio-init
+    restart: "no"
+    env_file: .env
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}
+        mc mb --ignore-existing local/ch-cold
+        mc ls local
+        echo "Бакеты готовы: ch-cold"
+
+  # ──────────────────────────────────────────────
+  # Метаданные Airflow (отдельно от source_db)
+  # ──────────────────────────────────────────────
+  postgres-airflow:
+    image: postgres:16
+    container_name: dwh-postgres-airflow
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${AIRFLOW_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_POSTGRES_DB}
+    volumes:
+      - postgres_airflow_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${AIRFLOW_POSTGRES_USER} -d ${AIRFLOW_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Одноразовый init: таблицы метаданных + пользовательтор admin
+  airflow-init:
+    image: apache/airflow:2.9.3
+    container_name: dwh-airflow-init
+    env_file: .env
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+    environment: &airflow-common-env
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_POSTGRES_USER}:${AIRFLOW_POSTGRES_PASSWORD}@postgres-airflow/${AIRFLOW_POSTGRES_DB}
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST}
+      CLICKHOUSE_HTTP_PORT: ${CLICKHOUSE_HTTP_PORT}
+    command: >-
+      bash -c "
+        airflow db migrate &&
+        (airflow users list | grep -q ${AIRFLOW_ADMIN_USER} ||
+        airflow users create --username ${AIRFLOW_ADMIN_USER} --password ${AIRFLOW_ADMIN_PASSWORD} --firstname Admin --lastname User --role Admin --email admin@example.com)
+      "
+    restart: "no"
+
+  # Scheduler: планирование и запуск DAG
+  airflow-scheduler:
+    image: apache/airflow:2.9.3
+    container_name: dwh-airflow-scheduler
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./sql/ch:/opt/airflow/dags/sql_ch:ro
+      - airflow_logs:/opt/airflow/logs
+    command: scheduler
+
+  # Webserver: UI на localhost:8080
+  airflow-webserver:
+    image: apache/airflow:2.9.3
+    container_name: dwh-airflow-webserver
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres-airflow:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      <<: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./sql/ch:/opt/airflow/dags/sql_ch:ro
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - "8080:8080"
+    command: webserver
+
+  # После старта стека один раз триггерит dwh_pipeline (DAG не на паузе)
+  airflow-trigger-pipeline:
+    image: apache/airflow:2.9.3
+    container_name: dwh-airflow-trigger-pipeline
+    restart: "no"
+    env_file: .env
+    depends_on:
+      airflow-scheduler:
+        condition: service_started
+      airflow-webserver:
+        condition: service_started
+      clickhouse:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./sql/ch:/opt/airflow/dags/sql_ch:ro
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        set -e
+        echo "Ожидание появления DAG dwh_pipeline..."
+        for i in $$(seq 1 60); do
+          if airflow dags list 2>/dev/null | grep -q dwh_pipeline; then
+            break
+          fi
+          sleep 5
+        done
+        airflow dags unpause dwh_pipeline || true
+        if airflow dags list-runs -d dwh_pipeline --state running 2>/dev/null | grep -q dwh_pipeline; then
+          echo "dwh_pipeline уже выполняется — триггер пропущен"
+        elif airflow dags list-runs -d dwh_pipeline --state success 2>/dev/null | grep -q dwh_pipeline; then
+          echo "dwh_pipeline уже успешно отработал — триггер пропущен"
+        else
+          airflow dags trigger dwh_pipeline
+          echo "Запущен dwh_pipeline"
+        fi
+
+  # ──────────────────────────────────────────────
+  # BI: Apache Superset (читает dm.* в ClickHouse)
+  # UI: http://localhost:8088
+  # ──────────────────────────────────────────────
+  postgres-superset:
+    image: postgres:16
+    container_name: dwh-postgres-superset
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_USER: ${SUPERSET_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${SUPERSET_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${SUPERSET_POSTGRES_DB}
+    volumes:
+      - postgres_superset_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SUPERSET_POSTGRES_USER} -d ${SUPERSET_POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  superset-init:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: dwh-superset-init
+    restart: "no"
+    env_file: .env
+    depends_on:
+      postgres-superset:
+        condition: service_healthy
+    environment: &superset-common-env
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      DATABASE_URL: postgresql+psycopg2://${SUPERSET_POSTGRES_USER}:${SUPERSET_POSTGRES_PASSWORD}@postgres-superset/${SUPERSET_POSTGRES_DB}
+      SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    command: >
+      bash -c "
+        superset db upgrade &&
+        (superset fab list-users | grep -q ${SUPERSET_ADMIN_USER} ||
+         superset fab create-admin --username ${SUPERSET_ADMIN_USER} --firstname Admin --lastname User --email admin@example.com --password ${SUPERSET_ADMIN_PASSWORD}) &&
+        superset init
+      "
+
+  superset:
+    build:
+      context: ./superset
+      dockerfile: Dockerfile
+    container_name: dwh-superset
+    restart: unless-stopped
+    env_file: .env
+    depends_on:
+      postgres-superset:
+        condition: service_healthy
+      superset-init:
+        condition: service_completed_successfully
+      clickhouse:
+        condition: service_healthy
+    environment:
+      <<: *superset-common-env
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    ports:
+      - "8088:8088"
+    command: ["bash", "-c", "superset run -h 0.0.0.0 -p 8088 --with-threads"]
+
+volumes:
+  postgres_data:
+  postgres_airflow_data:
+  postgres_superset_data:
+  clickhouse_data:
+  minio_data:
+  airflow_logs:

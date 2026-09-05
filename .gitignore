@@ -1,0 +1,19 @@
+# Local secrets — do not commit
+.env
+.env.local
+
+# Archive (local only — not published)
+archive/
+
+# Python / OS
+__pycache__/
+*.py[cod]
+.Python
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Logs / temp
+*.log
+airflow_logs/
